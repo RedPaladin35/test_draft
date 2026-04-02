@@ -272,3 +272,172 @@ class TestHestonAsianPricer:
 
         assert r_arith.price >= r_geo.price - 0.10, \
             f"Arith {r_arith.price:.4f} should >= Geo {r_geo.price:.4f}"
+
+
+# ------------------------------------------------------------------
+# QE scheme tests
+# ------------------------------------------------------------------
+
+class TestQEScheme:
+
+    def test_qe_path_shapes(self):
+        """QE scheme produces paths of correct shape."""
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        sim = HestonSimulator(params, n_paths=500, n_steps=50, scheme='qe', seed=1)
+        S, v = sim.simulate(100, 1.0, 0.05)
+        assert S.shape == (500, 51)
+        assert v.shape == (500, 51)
+
+    def test_qe_variance_non_negative(self):
+        """QE variance is non-negative by construction — no truncation needed."""
+        params = HestonParams(v0=0.04, kappa=0.5, v_bar=0.04, xi=0.8, rho=-0.7)
+        sim = HestonSimulator(params, n_paths=5000, n_steps=50, scheme='qe', seed=1)
+        _, v = sim.simulate(100, 1.0, 0.05)
+        assert np.all(v >= 0), f"QE variance went negative: min={v.min():.6f}"
+
+    def test_qe_spot_positive(self):
+        """QE spot prices are always positive."""
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        sim = HestonSimulator(params, n_paths=2000, n_steps=50, scheme='qe', seed=1)
+        S, _ = sim.simulate(100, 1.0, 0.05)
+        assert np.all(S > 0)
+
+    def test_qe_martingale_condition(self):
+        """QE: E[S_T] = S0 * e^{(r-q)*T} within 1%."""
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        sim = HestonSimulator(params, n_paths=100_000, n_steps=50,
+                               scheme='qe', antithetic=True, seed=42)
+        S, _ = sim.simulate(100, 1.0, 0.05)
+        theoretical = 100 * np.exp(0.05)
+        empirical   = np.mean(S[:, -1])
+        assert abs(empirical - theoretical) / theoretical < 0.01, \
+            f"QE martingale: E[S_T]={empirical:.4f}, expected={theoretical:.4f}"
+
+    def test_qe_agrees_with_euler_atm_call(self):
+        """
+        QE and Euler-Milstein should give close prices for ATM European call.
+        Both are correct — they should agree within MC noise.
+        """
+        from options_lib.models.heston import Heston
+        from options_lib.instruments.european import EuropeanOption
+        from options_lib.instruments.base import MarketData, OptionType
+
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+
+        # Reference: Heston FFT price (analytical, exact)
+        heston_model = Heston(params)
+        call = EuropeanOption(100, 1.0, OptionType.CALL)
+        mkt  = MarketData(spot=100, rate=0.05)
+        fft_price = heston_model.price(call, mkt)
+
+        # QE MC price
+        sim_qe = HestonSimulator(params, n_paths=100_000, n_steps=50,
+                                  scheme='qe', antithetic=True, seed=42)
+        S_T_qe = sim_qe.terminal_distribution(100, 1.0, 0.05, 0.0)
+        qe_price = float(np.exp(-0.05) * np.mean(np.maximum(S_T_qe - 100, 0)))
+
+        # Euler price
+        sim_euler = HestonSimulator(params, n_paths=100_000, n_steps=50,
+                                     scheme='euler', antithetic=True, seed=42)
+        S_T_euler = sim_euler.terminal_distribution(100, 1.0, 0.05, 0.0)
+        euler_price = float(np.exp(-0.05) * np.mean(np.maximum(S_T_euler - 100, 0)))
+
+        # Both should be within 0.20 of FFT
+        assert abs(qe_price - fft_price) < 0.20, \
+            f"QE price {qe_price:.4f} vs FFT {fft_price:.4f}"
+        assert abs(euler_price - fft_price) < 0.20, \
+            f"Euler price {euler_price:.4f} vs FFT {fft_price:.4f}"
+
+    def test_qe_fewer_steps_still_accurate(self):
+        """
+        Key benefit of QE: works well with fewer time steps.
+        QE with n_steps=10 should be more accurate than Euler with n_steps=10.
+        """
+        from options_lib.models.heston import Heston
+        from options_lib.instruments.european import EuropeanOption
+        from options_lib.instruments.base import MarketData, OptionType
+
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        heston_model = Heston(params)
+        call = EuropeanOption(100, 1.0, OptionType.CALL)
+        mkt  = MarketData(spot=100, rate=0.05)
+        fft_price = heston_model.price(call, mkt)
+
+        n_paths = 50_000
+        n_steps_coarse = 10   # very few steps — where Euler degrades
+
+        sim_qe = HestonSimulator(params, n_paths=n_paths, n_steps=n_steps_coarse,
+                                  scheme='qe', antithetic=True, seed=42)
+        sim_euler = HestonSimulator(params, n_paths=n_paths, n_steps=n_steps_coarse,
+                                     scheme='euler', antithetic=True, seed=42)
+
+        S_qe    = sim_qe.terminal_distribution(100, 1.0, 0.05)
+        S_euler = sim_euler.terminal_distribution(100, 1.0, 0.05)
+
+        qe_price    = float(np.exp(-0.05) * np.mean(np.maximum(S_qe    - 100, 0)))
+        euler_price = float(np.exp(-0.05) * np.mean(np.maximum(S_euler - 100, 0)))
+
+        err_qe    = abs(qe_price    - fft_price)
+        err_euler = abs(euler_price - fft_price)
+
+        # QE should be at least as accurate as Euler with same coarse grid
+        # (typically significantly better)
+        assert err_qe <= err_euler + 0.10, \
+            f"QE error {err_qe:.4f} vs Euler error {err_euler:.4f} (FFT ref={fft_price:.4f})"
+
+    def test_as_lsmc_simulator_interface(self):
+        """
+        as_lsmc_simulator() returns a callable with the correct
+        (S0, T, r, q, n_paths, n_steps) -> S_paths signature.
+        """
+        from options_lib.numerics.lsmc import LongstaffSchwartz
+        from options_lib.instruments.american import AmericanOption
+        from options_lib.instruments.base import OptionType
+
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        sim    = HestonSimulator(params, n_paths=5000, n_steps=50,
+                                  scheme='euler', seed=42)
+
+        lsmc = LongstaffSchwartz(
+            sigma          = 0.20,
+            n_paths        = 5000,
+            n_steps        = 50,
+            path_simulator = sim.as_lsmc_simulator(),
+        )
+        am_put = AmericanOption(100, 1.0, OptionType.PUT)
+        result = lsmc.price(am_put, spot=100, rate=0.05)
+
+        assert result.price > 0, "Heston LSMC price should be positive"
+        assert result.price < 30, "Heston LSMC price seems unreasonably large"
+        assert result.std_error >= 0
+
+    def test_as_lsmc_simulator_qe(self):
+        """
+        as_lsmc_simulator() works with QE scheme too —
+        American put under Heston QE paths.
+        """
+        from options_lib.numerics.lsmc import LongstaffSchwartz
+        from options_lib.instruments.american import AmericanOption
+        from options_lib.instruments.base import OptionType
+
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        sim    = HestonSimulator(params, n_paths=5000, n_steps=50,
+                                  scheme='qe', seed=42)
+
+        lsmc = LongstaffSchwartz(
+            sigma          = 0.20,
+            n_paths        = 5000,
+            n_steps        = 50,
+            path_simulator = sim.as_lsmc_simulator(),
+        )
+        am_put = AmericanOption(100, 1.0, OptionType.PUT)
+        result = lsmc.price(am_put, spot=100, rate=0.05)
+
+        assert result.price > 0
+        assert result.price < 30
+
+    def test_invalid_scheme_raises(self):
+        """Invalid scheme raises ValueError."""
+        params = HestonParams(v0=0.04, kappa=2.0, v_bar=0.04, xi=0.3, rho=-0.7)
+        with pytest.raises(ValueError, match="scheme"):
+            HestonSimulator(params, scheme='bad_scheme')
