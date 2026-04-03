@@ -33,6 +33,7 @@ from options_lib.risk.greeks import (
 from options_lib.risk.surface_greeks import (
     SurfaceGreekEngine,
     SurfaceGreeks,
+    VegaMatrix,
     VolSurfaceScenario,
     scenario_pnl,
 )
@@ -50,6 +51,7 @@ __all__ = [
     # Surface Greeks
     "SurfaceGreekEngine",
     "SurfaceGreeks",
+    "VegaMatrix",
     "VolSurfaceScenario",
     "scenario_pnl",
     # P&L attribution
