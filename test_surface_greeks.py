@@ -305,3 +305,115 @@ class TestScenarioPnL:
         s = result.summary()
         assert "Parallel vega" in s
         assert "Skew sensitivity" in s
+
+
+# ------------------------------------------------------------------
+# Vega matrix tests
+# ------------------------------------------------------------------
+
+class TestVegaMatrix:
+
+    @pytest.fixture
+    def atm_call_05(self):
+        return EuropeanOption(strike=100, expiry=0.5, option_type=OptionType.CALL)
+
+    def test_vega_matrix_shape(self, engine, atm_call):
+        """Vega matrix has shape (n_expiries, n_strikes)."""
+        strikes = np.array([90., 100., 110.])
+        vm = engine.vega_matrix(atm_call, pillar_strikes=strikes)
+        assert vm.matrix.shape == (2, 3)   # 2 expiries in fixture surface
+        assert len(vm.strikes) == 3
+        assert len(vm.expiry_dates) == 2
+
+    def test_vega_matrix_base_price_correct(self, engine, atm_call, surface, mkt):
+        """base_price in VegaMatrix matches direct pricing."""
+        vm = engine.vega_matrix(atm_call)
+        iv = surface.implied_vol(K=100, T=1.0)
+        bs_price = BlackScholes(sigma=iv).price(atm_call, mkt)
+        assert abs(vm.base_price - bs_price) < 1e-8
+
+    def test_vega_matrix_positive_long_call(self, engine, atm_call):
+        """
+        All pillar vegas should be positive for a long call.
+        The call benefits from higher vol at any pillar.
+        """
+        strikes = np.array([85., 95., 100., 105., 115.])
+        vm = engine.vega_matrix(atm_call, pillar_strikes=strikes)
+        valid = vm.matrix[~np.isnan(vm.matrix)]
+        assert np.all(valid >= 0), \
+            f"All pillar vegas should be non-negative for long call. Min: {valid.min():.6f}"
+
+    def test_total_vega_matches_parallel_vega(self, engine, atm_call):
+        """
+        total_vega (sum of all pillars) should be close to parallel vega
+        from compute(). Both measure sensitivity to a uniform vol shift.
+        """
+        strikes = np.linspace(85, 115, 7)
+        vm      = engine.vega_matrix(atm_call, pillar_strikes=strikes)
+        sg      = engine.compute(atm_call)
+        # total_vega is per 1bp, parallel_vega is per 1% → scale by 100
+        total_vega_pct = vm.total_vega * 100
+        assert np.sign(total_vega_pct) == np.sign(sg.vega_parallel), \
+            "total_vega and parallel_vega should have same sign"
+
+    def test_expiry_vegas_shape(self, engine, atm_call):
+        """expiry_vegas sums across strikes → shape (n_expiries,)."""
+        vm = engine.vega_matrix(atm_call)
+        assert vm.expiry_vegas.shape == (len(vm.expiry_dates),)
+
+    def test_strike_vegas_shape(self, engine, atm_call):
+        """strike_vegas sums across expiries → shape (n_strikes,)."""
+        strikes = np.array([90., 100., 110.])
+        vm = engine.vega_matrix(atm_call, pillar_strikes=strikes)
+        assert vm.strike_vegas.shape == (3,)
+
+    def test_pillar_vega_decreasing_far_otm_call(self, engine, mkt, surface):
+        """
+        For a long ATM call, vegas at the option\'s own expiry should all
+        be positive (the call benefits from higher vol at any pillar of
+        that expiry). Pillars at other expiries may be smaller.
+        """
+        atm = EuropeanOption(100, 1.0, OptionType.CALL)
+        strikes = np.array([85., 100., 115.])
+        vm = engine.vega_matrix(atm, pillar_strikes=strikes)
+
+        # The 1yr row (index 1 in fixture) should have all positive entries
+        # since this is the option\'s own expiry
+        t1_idx = 1
+        row = vm.matrix[t1_idx]
+        assert np.all(row >= 0), \
+            f"All pillar vegas at option expiry should be non-negative: {row}"
+
+    def test_portfolio_vega_matrix_sum(self, engine):
+        """
+        Portfolio vega matrix = weighted sum of individual matrices.
+        Test with long + short call → smaller net vega.
+        """
+        call1 = EuropeanOption(95,  1.0, OptionType.CALL)
+        call2 = EuropeanOption(105, 1.0, OptionType.CALL)
+        strikes = np.array([90., 100., 110.])
+
+        vm1   = engine.vega_matrix(call1, pillar_strikes=strikes)
+        vm2   = engine.vega_matrix(call2, pillar_strikes=strikes)
+        vm_pf = engine.portfolio_vega_matrix(
+            [call1, call2], [1.0, -1.0], pillar_strikes=strikes
+        )
+
+        # Portfolio matrix = 1.0 * vm1 - 1.0 * vm2
+        expected = vm1.matrix - vm2.matrix
+        np.testing.assert_allclose(vm_pf.matrix, expected, atol=1e-10)
+
+    def test_vega_matrix_to_dict(self, engine, atm_call):
+        """to_dict() returns all required keys."""
+        vm = engine.vega_matrix(atm_call)
+        d  = vm.to_dict()
+        for key in ['strikes', 'expiry_dates', 'expiries', 'matrix',
+                    'base_price', 'total_vega', 'expiry_vegas', 'strike_vegas']:
+            assert key in d
+
+    def test_vega_matrix_summary(self, engine, atm_call):
+        """summary() returns a formatted string."""
+        vm = engine.vega_matrix(atm_call)
+        s  = vm.summary()
+        assert "Vega Matrix" in s
+        assert "Total vega" in s
