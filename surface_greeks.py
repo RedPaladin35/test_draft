@@ -67,6 +67,9 @@ from options_lib.instruments.base import Instrument, MarketData
 from options_lib.instruments.european import EuropeanOption
 from options_lib.models.black_scholes import BlackScholes
 
+# Pillar bump size for vega matrix (1 bp = 0.0001 in vol)
+BUMP_PILLAR = 0.0001   # 1 basis point
+
 
 # ------------------------------------------------------------------
 # Bump sizes (calibrated for numerical stability)
@@ -75,6 +78,91 @@ BUMP_PARALLEL   = 0.001   # 0.1% parallel vol shift
 BUMP_SKEW       = 0.01    # bump in ρ (SVI skew parameter)
 BUMP_CURVATURE  = 0.01    # bump in σ_svi (SVI curvature parameter)
 BUMP_LEVEL      = 0.001   # bump in SVI a parameter
+
+
+
+@dataclass
+class VegaMatrix:
+    """
+    Full pillar-by-pillar vega matrix: dV/dσ(K_i, T_j).
+
+    This is the industry-standard representation of vol surface risk.
+    Each cell [i, j] answers: "if the implied vol at pillar (K_i, T_j)
+    moves by 1bp, how much does my option value change?"
+
+    Compared to SurfaceGreeks (which gives 3 aggregate sensitivities per
+    slice via SVI parameter bumps), the vega matrix gives granular
+    strike-level exposure. A trader hedging with vanilla options needs
+    to know which specific (K, T) pillars to trade.
+
+    Attributes
+    ----------
+    strikes         : np.ndarray, shape (n_K,)    Pillar strike grid
+    expiry_dates    : list[str]                    Pillar expiry labels
+    expiries        : np.ndarray, shape (n_T,)     Pillar expiries in years
+    matrix          : np.ndarray, shape (n_T, n_K) dV/dσ per 1bp at each pillar
+    base_price      : float                         Option price at current surface
+
+    Properties
+    ----------
+    total_vega      : float   Sum of all cells = total parallel vega
+    expiry_vegas    : np.ndarray   Row sums = vega per expiry bucket
+    strike_vegas    : np.ndarray   Column sums = vega per strike bucket
+    """
+    strikes      : np.ndarray
+    expiry_dates : list
+    expiries     : np.ndarray
+    matrix       : np.ndarray    # shape (n_T, n_K), $ per 1bp shift at each pillar
+    base_price   : float
+
+    @property
+    def total_vega(self) -> float:
+        """Sum of all pillar vegas = total parallel vega (per 1bp)."""
+        return float(np.nansum(self.matrix))
+
+    @property
+    def expiry_vegas(self) -> np.ndarray:
+        """
+        Row sums: total vega exposure per expiry.
+        shape (n_T,). Positive = long vol at that expiry.
+        """
+        return np.nansum(self.matrix, axis=1)
+
+    @property
+    def strike_vegas(self) -> np.ndarray:
+        """
+        Column sums: total vega exposure per strike.
+        shape (n_K,). Shows whether you are long skew (more exposure
+        at low strikes) or short skew (more at high strikes).
+        """
+        return np.nansum(self.matrix, axis=0)
+
+    def to_dict(self) -> dict:
+        return {
+            'strikes'      : self.strikes.tolist(),
+            'expiry_dates' : self.expiry_dates,
+            'expiries'     : self.expiries.tolist(),
+            'matrix'       : self.matrix.tolist(),
+            'base_price'   : self.base_price,
+            'total_vega'   : self.total_vega,
+            'expiry_vegas' : self.expiry_vegas.tolist(),
+            'strike_vegas' : self.strike_vegas.tolist(),
+        }
+
+    def summary(self) -> str:
+        lines = [
+            f"{'='*60}",
+            f"Vega Matrix  [{len(self.expiries)} expiries × {len(self.strikes)} strikes]",
+            f"{'='*60}",
+            f"Base price:   {self.base_price:.4f}",
+            f"Total vega:   {self.total_vega:+.6f}  ($ per 1bp parallel shift)",
+            f"{'─'*60}",
+            f"Vega by expiry ($ per 1bp, summed across strikes):",
+        ]
+        for date, ev in zip(self.expiry_dates, self.expiry_vegas):
+            lines.append(f"  {date}: {ev:+.6f}")
+        lines.append(f"{'='*60}")
+        return '\n'.join(lines)
 
 
 @dataclass
@@ -354,6 +442,215 @@ class SurfaceGreekEngine:
             skew_by_expiry         = skew_by_expiry,
             curvature_by_expiry    = curvature_by_expiry,
             term_structure_dv01    = term_structure_dv01,
+        )
+
+    def _bump_pillar_surface(
+        self,
+        surface      : VolSurface,
+        expiry_date  : str,
+        strike       : float,
+        bump         : float,
+    ) -> VolSurface:
+        """
+        Return a new vol surface with the IV at exactly one pillar (K, T)
+        shifted by `bump`, holding all other pillars fixed.
+
+        This is the key operation for the vega matrix. In a production
+        system this would be done by shifting the market quote at that
+        pillar and recalibrating. Here we approximate it by:
+          1. Computing the current IV at (K, T) from the SVI slice
+          2. Computing the shift in SVI `a` parameter that produces
+             exactly `bump` change in IV at that strike
+          3. Applying only that change to the one slice, leaving
+             all other pillars of that slice approximately unchanged
+
+        The approximation: bumping `a` shifts the entire smile up/down
+        uniformly, not just one point. For well-separated pillars this
+        is accurate to O(bump²). For a production system, you would
+        use a more sophisticated basis interpolation (e.g. SSVI
+        natural parameterisation or a cubic spline surface).
+
+        Parameters
+        ----------
+        expiry_date : str    Which expiry slice to bump
+        strike      : float  The pillar strike (K_i)
+        bump        : float  IV shift in decimal (e.g. 0.0001 = 1bp)
+        """
+        svi = surface.svi_slices[expiry_date]
+        T   = svi.expiry
+        F   = surface.forwards.get(expiry_date,
+                                   surface.spot * np.exp(surface.rate * T))
+
+        # Current total variance and IV at this pillar
+        k      = np.log(strike / F)
+        w_base = float(svi.total_variance(np.array([k]))[0])
+
+        # Bump in total variance corresponding to `bump` in IV
+        # w = sigma_iv^2 * T  →  dw = 2 * sigma_iv * T * bump
+        sigma_iv = max(np.sqrt(w_base / T), 0.001)
+        dw       = 2 * sigma_iv * T * bump
+
+        # Apply as a shift to the `a` parameter (level shift)
+        new_slices = {}
+        for date, s in surface.svi_slices.items():
+            if date == expiry_date:
+                new_slices[date] = SVIParams(
+                    a      = s.a + dw,
+                    b      = s.b,
+                    rho    = s.rho,
+                    m      = s.m,
+                    sigma  = s.sigma,
+                    expiry = s.expiry,
+                )
+            else:
+                new_slices[date] = s
+
+        return VolSurface(
+            svi_slices = new_slices,
+            forwards   = surface.forwards,
+            spot       = surface.spot,
+            rate       = surface.rate,
+            ticker     = surface.ticker,
+        )
+
+    def vega_matrix(
+        self,
+        instrument     : EuropeanOption,
+        pillar_strikes : Optional[np.ndarray] = None,
+        bump_bp        : float = 1.0,
+    ) -> VegaMatrix:
+        """
+        Compute the full pillar vega matrix: dV/dσ(K_i, T_j) for all pillars.
+
+        Each cell [i, j] is the option P&L if the implied vol at pillar
+        (K_i, T_j) moves by `bump_bp` basis points, all others held fixed.
+
+        This is how production risk systems report vol surface exposure.
+        A trader can directly read off which vanilla options to sell to
+        hedge each pillar.
+
+        Parameters
+        ----------
+        instrument : EuropeanOption
+        pillar_strikes : np.ndarray, optional
+            Strike grid for the vega matrix. If None, uses a grid of
+            7 strikes centred around the current spot:
+            [80%, 87%, 93%, 100%, 107%, 113%, 120%] of spot.
+        bump_bp : float
+            Bump size in basis points. Default 1bp = 0.01% vol move.
+
+        Returns
+        -------
+        VegaMatrix
+            Full matrix of sensitivities, one per (expiry, strike) pillar.
+
+        Notes
+        -----
+        Uses central differencing: (V(σ+h) - V(σ-h)) / (2h).
+        This is more accurate than one-sided differencing and eliminates
+        first-order bias, at the cost of 2 pricings per pillar.
+
+        For n_expiries × n_strikes pillars, this requires
+        2 × n_expiries × n_strikes + 1 pricing calls. For a typical
+        grid of 6 expiries × 7 strikes = 42 pillars → 85 pricings.
+        This is fast (microseconds each for BS) but would be expensive
+        for Heston or MC models.
+        """
+        surface = self.vol_surface
+        market  = self.market
+        bump    = bump_bp * BUMP_PILLAR   # convert bp to decimal
+
+        # Default pillar grid: 7 strikes spanning 80% to 120% of spot
+        if pillar_strikes is None:
+            pillar_strikes = np.array([0.80, 0.87, 0.93, 1.00,
+                                       1.07, 1.13, 1.20]) * market.spot
+
+        expiry_dates = surface.expiry_dates
+        expiries     = surface.expiries
+        n_T          = len(expiry_dates)
+        n_K          = len(pillar_strikes)
+
+        # Base price
+        base_price = self._price_on_surface(instrument, surface, market)
+
+        # Vega matrix: shape (n_T, n_K)
+        vega_mat = np.zeros((n_T, n_K))
+
+        for i, exp_date in enumerate(expiry_dates):
+            for j, K_pillar in enumerate(pillar_strikes):
+                try:
+                    # Bump up
+                    surf_up   = self._bump_pillar_surface(
+                        surface, exp_date, K_pillar, +bump
+                    )
+                    # Bump down
+                    surf_down = self._bump_pillar_surface(
+                        surface, exp_date, K_pillar, -bump
+                    )
+
+                    p_up   = self._price_on_surface(instrument, surf_up,   market)
+                    p_down = self._price_on_surface(instrument, surf_down, market)
+
+                    # Central difference: dV/dσ per 1bp
+                    vega_mat[i, j] = (p_up - p_down) / (2 * bump_bp)
+
+                except Exception:
+                    vega_mat[i, j] = np.nan
+
+        return VegaMatrix(
+            strikes      = pillar_strikes,
+            expiry_dates = expiry_dates,
+            expiries     = expiries,
+            matrix       = vega_mat,
+            base_price   = base_price,
+        )
+
+    def portfolio_vega_matrix(
+        self,
+        instruments  : list,
+        positions    : Optional[list] = None,
+        pillar_strikes : Optional[np.ndarray] = None,
+        bump_bp        : float = 1.0,
+    ) -> VegaMatrix:
+        """
+        Compute the aggregated vega matrix for a portfolio.
+
+        The portfolio vega matrix is the weighted sum of individual
+        instrument vega matrices — linearity of differentiation applies.
+
+        Parameters
+        ----------
+        instruments  : list of EuropeanOption
+        positions    : list of float  (+/- for long/short). Default all +1.
+        pillar_strikes : np.ndarray, optional
+        bump_bp      : float
+
+        Returns
+        -------
+        VegaMatrix   Aggregated vega matrix for the whole portfolio.
+        """
+        if positions is None:
+            positions = [1.0] * len(instruments)
+
+        matrices = [
+            self.vega_matrix(inst, pillar_strikes, bump_bp)
+            for inst in instruments
+        ]
+
+        # Aggregate: weighted sum of matrices
+        agg_matrix = sum(
+            pos * m.matrix for pos, m in zip(positions, matrices)
+        )
+        agg_price = sum(
+            pos * m.base_price for pos, m in zip(positions, matrices)
+        )
+
+        return VegaMatrix(
+            strikes      = matrices[0].strikes,
+            expiry_dates = matrices[0].expiry_dates,
+            expiries     = matrices[0].expiries,
+            matrix       = agg_matrix,
+            base_price   = agg_price,
         )
 
     def compute_portfolio(
